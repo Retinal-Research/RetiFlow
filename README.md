@@ -2,6 +2,8 @@
 
 > Improved Retinal Branching Angle Detection
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 **RetiFlow** is an end-to-end pipeline for retinal artery/vein (A/V) segmentation and
 bifurcation angle measurement. It takes a color fundus image and produces
 per-vessel-type bifurcation detections with angles and branch directions, robust
@@ -207,4 +209,27 @@ RetiFlow/
 
 ## Citation
 
-If you use RetiFlow in your research, please cite this repository.
+If you use RetiFlow in your research, please cite this repository and the
+original RBAD benchmark:
+
+```bibtex
+@inproceedings{wang2024rbad,
+  title={RBAD: A dataset and benchmark for retinal vessels branching angle detection},
+  author={Wang, Hao and Zhu, Wenhui and Qin, Jiayou and Li, Xin and Dumitrascu, Oana and Chen, Xiwen and Qiu, Peijie and Razi, Abolfazl and Wang, Yalin},
+  booktitle={2024 IEEE EMBS International Conference on Biomedical and Health Informatics (BHI)},
+  pages={1--8},
+  year={2024},
+  organization={IEEE}
+}
+```
+
+## Acknowledgements
+
+RetiFlow builds on two open-source projects:
+
+- **RBAD** — the original retinal branching angle detection benchmark and
+  algorithm: <https://github.com/Retinal-Research/RBAD>
+- **RRWNet** — the recursive refinement network for retinal artery/vein
+  segmentation: <https://github.com/j-morano/rrwnet>
+
+We thank the authors of both projects for making their work publicly available.
