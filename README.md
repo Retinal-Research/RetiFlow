@@ -85,7 +85,8 @@ Vessel map (AV3 probability / mask / skeleton)
 pip install -r requirements.txt
 ```
 
-Dependencies: `numpy`, `opencv-python`, `scikit-image`, `scipy`, `matplotlib`.
+Dependencies: `numpy`, `opencv-python`, `scikit-image`, `scipy`, `matplotlib`,
+`Pillow`, `imageio`.
 
 > **Note**: RetiFlow does **not** require `torch` or any segmentation network.
 > It only needs the vessel maps as input.
@@ -139,6 +140,30 @@ python -m RetiFlow.infer \
   --root-x <x> --root-y <y> \
   --out <output_dir>
 ```
+
+---
+
+## Plugins / Adapters
+
+RetiFlow ships adapters for common upstream workflow output formats.
+
+### AutoMorph
+
+[AutoMorph](https://github.com/rmaphoh/AutoMorph) produces a rich M2 output
+(`Results/M2/`) with A/V skeletons, A/V binary masks, vessel skeletons, and
+optic disc/cup masks. The `AutomorphAdapter` maps this to RetiFlow:
+
+```bash
+python -m RetiFlow.plugins.automorph \
+  --m2-dir <.../Results/M2> \
+  --out <output_dir> \
+  --mode skeleton          # or 'mask'
+```
+
+It reads A/V skeletons (or masks), uses the **optic-disc centroid** as the root
+(with fallback to the Gaussian-density centroid), and runs RetiFlow on A and V
+separately. The summary reports both the disc and Gaussian centroids for
+cross-comparison.
 
 ---
 
@@ -259,6 +284,8 @@ RetiFlow/
 ├── completion/           # v3 probability-path completion
 │   ├── completion.py
 │   └── centerline.py
+├── plugins/              # Upstream workflow adapters
+│   └── automorph.py      # AutoMorph M2 output adapter
 ├── examples/             # Example outputs
 └── README.md
 ```

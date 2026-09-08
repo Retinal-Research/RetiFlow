@@ -187,6 +187,8 @@ def process_prob(a, v, bv, cfg, out, root_yx=None):
 
 def process_single(skel, cfg, out, root_yx=None, is_mask=False):
     """单张掩码/骨架输入：中心线（若掩码）+ 两遍法 RBAD（无 A/V 归属）。"""
+    out = Path(out)
+    out.mkdir(parents=True, exist_ok=True)
     if is_mask:
         from skimage.morphology import skeletonize
         skel = skeletonize(skel.astype(np.uint8)).astype(bool)
