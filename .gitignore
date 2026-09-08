@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.pth
+*.npz
+exp/
+pipeline_a_out/
