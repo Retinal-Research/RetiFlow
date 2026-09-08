@@ -1,163 +1,210 @@
 # RetiFlow
 
-> Improved version of Retinal Branching Angle Detection algorithm
+> Improved Retinal Branching Angle Detection
 
-端到端流水线：眼底图 → RRWNet 多任务分割（A/V/BV）→ v3 概率路径补全 → 两遍法 RBAD 分叉检测。
+**RetiFlow** is an end-to-end pipeline for retinal artery/vein (A/V) segmentation and
+bifurcation angle measurement. It takes a color fundus image and produces
+per-vessel-type bifurcation detections with angles and branch directions, robust
+to the discontinuous vessel masks that plague real-world segmentation.
 
-核心解决两个问题：
-1. **A/V 掩码不连续**导致分叉检测失效 → 用连续概率图补全 A/V 骨架。
-2. **原版 RBAD 依赖全局连通**（单 root 遍历，断点即大面积丢失）→ 两遍法（全岛遍历 + 端点桥接）。
+---
 
-## 流水线
+## Three Key Improvements
+
+### 1. A/V maps measured separately
+Arteries and veins are segmented and measured **independently**, not as a single
+vessel tree. Each class gets its own bifurcation statistics (count, angle
+distribution), enabling artery-specific and vein-specific clinical analysis.
+
+### 2. Probability-mask completion + centerline extraction
+Instead of hard-thresholding each A/V channel (which breaks thin vessels), the
+continuous **probability maps** are used to complete the A/V masks. A
+probability-cost **centerline** is then extracted as the skeleton — more precise
+and continuous than naive threshold-and-thin.
+
+### 3. Endpoint bridging
+Disconnected vessel fragments are **actively repaired**: each endpoint is traced
+back along its parent arm, its tangent is estimated, and facing endpoints are
+bridged (or an endpoint lands on a foreign branch body) under strict geometric
+and BV-support checks. The original RBAD angle logic then runs on the repaired,
+continuous skeleton.
+
+---
+
+## Pipeline
 
 ```
-眼底图
-  → RRWNet 分割 (A/V/BV 三通道概率图)
-  → v3 概率路径补全 (BV 决定血管域，A/V 概率决定归属，桥接断口)
-  → 两遍法 RBAD (原版 fast_keypoints + 全岛遍历 + 端点桥接)
-  → 分叉点 + 角度 + 方向可视化
+Fundus image
+  → RRWNet segmentation (A/V/BV probability maps)
+  → v3 probability-path completion (BV defines vessel domain, A/V define class)
+  → two-pass RBAD (original fast_keypoints + all-island traversal + endpoint bridge)
+  → bifurcation points + angles + branch directions
 ```
 
-## 安装
+---
+
+## Installation
 
 ```bash
 pip install -r requirements.txt
 ```
 
-依赖：`torch`、`torchvision`、`numpy`、`opencv-python`、`scikit-image`、`scipy`、`matplotlib`。
+Dependencies: `torch`, `torchvision`, `numpy`, `opencv-python`, `scikit-image`,
+`scipy`, `matplotlib`.
 
-RRWNet 权重（`rrwnet_HRF_0.pth` 等）需放在可访问路径，用 `--weights` 指定。
+RRWNet weights (e.g. `rrwnet_HRF_0.pth`) must be reachable; point to them with
+`--weights`.
 
-## 用法
+---
 
-### 从眼底图推理
+## Usage
+
+### From a fundus image
 
 ```bash
 python -m RBAD_v2.infer \
-  --image <眼底图路径> \
+  --image <fundus_image> \
   --weights rrwnet_HRF_0.pth \
-  --out <输出目录>
+  --out <output_dir>
 ```
 
-### 从已存概率图推理（跳过 RRWNet）
+### From saved probability maps (skip RRWNet)
 
 ```bash
 python -m RBAD_v2.infer \
-  --prob-dir <含 seg_probabilities.npz 或 seg_A/V/BV.png 的目录> \
-  --out <输出目录>
+  --prob-dir <dir with seg_probabilities.npz or seg_A/V/BV.png> \
+  --out <output_dir>
 ```
 
-## 参数控制
+---
 
-所有参数集中在 `config.py`，命令行可覆盖关键参数。
+## Parameters
 
-### 分割（`SegmentationConfig`）
-| 参数 | 默认 | 说明 |
+All parameters live in `config.py`; key ones are overridable on the command line.
+
+### Segmentation (`SegmentationConfig`)
+| Option | Default | Description |
 | --- | --- | --- |
-| `--iterations` | 5 | RRWNet 递归精炼次数（1=单次，5=循环5次） |
-| `thred` | 25 | 增强预处理 ROI 阈值 |
+| `--iterations` | 5 | RRWNet recursive refinement passes (1 = single, 5 = loop) |
+| `thred` | 25 | Enhancement ROI threshold |
 
-### v3 补全（`CompletionConfig`）
-| 参数 | 默认 | 说明 |
+### v3 Completion (`CompletionConfig`)
+| Option | Default | Description |
 | --- | --- | --- |
-| `--max-bridge-length` | 50 | 最大桥接路径长度（0 禁用） |
-| `--max-opposite-run` | 50 | 共享路径最大连续反类像素数 |
-| `--bridge-passes` | 5 | 桥接搜索轮数（0 禁用） |
-| `low_bv` / `high_bv` | 0.25 / 0.50 | BV 滞回阈值 |
+| `--max-bridge-length` | 50 | Max bridge path length (0 disables) |
+| `--max-opposite-run` | 50 | Max consecutive opposite-class pixels on a shared path |
+| `--bridge-passes` | 5 | Bridge search passes (0 disables) |
+| `low_bv` / `high_bv` | 0.25 / 0.50 | BV hysteresis thresholds |
 
-### 端点桥接（`EndpointBridgeConfig`）
-| 参数 | 默认 | 说明 |
+### Endpoint Bridge (`EndpointBridgeConfig`)
+| Option | Default | Description |
 | --- | --- | --- |
-| `--max-distance` | 40 | 最大新增路径长度 |
-| `--max-angle` | 35 | 端点切线到目标最大偏差（度） |
-| `--passes` | 2 | 修复轮数（0 禁用） |
-| `min_bv_mean` | 0.25 | 路径最小平均 BV 概率 |
+| `--max-distance` | 40 | Max added path length |
+| `--max-angle` | 35 | Max endpoint tangent-to-target deviation (deg) |
+| `--passes` | 2 | Repair passes (0 disables) |
+| `min_bv_mean` | 0.25 | Min mean BV probability along an accepted route |
 
-### RBAD 角度（`RbadConfig`）
-| 参数 | 默认 | 说明 |
+### RBAD Angle (`RbadConfig`)
+| Option | Default | Description |
 | --- | --- | --- |
-| `--tail` | 15 | 分支追踪长度 |
-| `angle_min` / `angle_max` | 20 / 120 | 保留角度范围 |
+| `--tail` | 15 | Branch tracing length |
+| `angle_min` / `angle_max` | 20 / 120 | Accepted angle range |
 
-## 示例
+---
 
-`examples/02_200228_200228_L_mac/` 是完整输出示例（真实眼底图）。
+## Example
 
-### 输出文件
-| 文件 | 说明 |
+`examples/02_200228_200228_L_mac/` is a complete run on a real fundus image.
+
+### A/V bifurcation overlays (with branch directions)
+
+| Artery (A) | Vein (V) |
 | --- | --- |
-| `overlay_A_aligned.png` | A 分叉 + 两条子支方向箭头 + 角度（红） |
-| `overlay_V_aligned.png` | V 分叉 + 方向箭头 + 角度（蓝） |
-| `AV_BV_combined.png` | A(粉)/V(青)/BV(蓝) 组合图（原版 rrwnet 映射） |
-| `A_mask.png` / `V_mask.png` | 补全后的二值掩码 |
-| `A_centerline.png` / `V_centerline.png` | 连续中心线 |
-| `enhanced_background.png` | 模型实际看到的增强图（overlay 背景） |
-| `summary.json` | 分叉统计、参数、BV root |
+| ![A overlay](examples/02_200228_200228_L_mac/overlay_A_aligned.png) | ![V overlay](examples/02_200228_200228_L_mac/overlay_V_aligned.png) |
 
-### 示例结果（02_200228_200228_L_mac）
-| 掩码 | 分叉数 | 角度 mean |
+### Combined A/V/BV map (original RRWNet color convention)
+
+A = magenta, V = cyan, BV = blue, crossing = white.
+
+![AV/BV combined](examples/02_200228_200228_L_mac/AV_BV_combined.png)
+
+### Completed masks and centerlines
+
+| A mask | V mask | A centerline | V centerline |
+| --- | --- | --- | --- |
+| ![A mask](examples/02_200228_200228_L_mac/A_mask.png) | ![V mask](examples/02_200228_200228_L_mac/V_mask.png) | ![A centerline](examples/02_200228_200228_L_mac/A_centerline.png) | ![V centerline](examples/02_200228_200228_L_mac/V_centerline.png) |
+
+### Example result (02_200228_200228_L_mac)
+| Class | Bifurcations | Mean angle |
 | --- | --- | --- |
 | A | 27 | 75.6° |
 | V | 44 | 73.6° |
 
-## 性能报告
+---
 
-实测（RTX GPU，608×608 输入，单张）：
+## Performance
 
-| 阶段 | 延迟 | 吞吐 |
+Measured on an RTX GPU, 608×608 input, single image:
+
+| Stage | Latency | Throughput |
 | --- | --- | --- |
-| RRWNet 纯推理（it5） | 85 ms | 11.7 fps |
-| 分割（含预处理） | ~0.8 s | 1.2 fps |
-| v3 补全（掩码） | ~1.2 s | 0.8 fps |
-| 中心线 | ~0.6 s | — |
-| 两遍法 RBAD | ~1.2 s | — |
-| **端到端总计** | **~3.7 s** | **0.27 fps** |
+| RRWNet inference (it5) | 85 ms | 11.7 fps |
+| Segmentation (incl. preprocessing) | ~0.8 s | 1.2 fps |
+| v3 completion (masks) | ~1.2 s | 0.8 fps |
+| Centerlines | ~0.6 s | — |
+| Two-pass RBAD | ~1.2 s | — |
+| **End-to-end total** | **~3.7 s** | **0.27 fps** |
 
-**瓶颈**：v3 补全 + 中心线 + 两遍法 RBAD（~3s，占 80%），RRWNet 推理本身很快（85ms）。
+**Bottleneck**: v3 completion + centerlines + two-pass RBAD (~3 s, ~80% of total).
+RRWNet inference itself is fast (85 ms).
 
-### 各检测方案对比（A/V 分叉数）
-| 方法 | A | V |
+### Detection comparison (A/V bifurcation counts)
+| Method | A | V |
 | --- | --- | --- |
-| 原版 RBAD（单 root） | 7 | 0 |
-| 局部检测（3分支要求） | 14 | 32 |
-| **两遍法（原版+全岛+桥接）** | **27** | **44** |
+| Original RBAD (single root) | 7 | 0 |
+| Local detection (3-branch) | 14 | 32 |
+| **Two-pass (original + all-island + bridge)** | **27** | **44** |
 
-两遍法用原版 RBAD 的角度逻辑，通过全岛遍历 + 端点桥接解决断点问题，A/V 分叉数最高。
+The two-pass method keeps the original RBAD angle logic while solving the
+discontinuity problem via all-island traversal and endpoint bridging.
 
-## 未来优化方向
+---
 
-1. **性能**：
-   - v3 补全和中心线有大量 Python 循环，可向量化或 Cython 化，预计提速 3-5 倍。
-   - 两遍法跑两遍原版 RBAD，可缓存第一遍结果，只对桥接区域重算。
-   - 批量推理时复用模型加载，摊薄分割开销。
+## Future Work
 
-2. **精度**：
-   - 用视盘 mask（`--disc-mask`）替代高斯密度启发式找 root，更符合解剖学。
-   - 端点桥接的 `max-distance` / `max-angle` 需在更多图上验证，避免错误连接。
-   - 分叉角目前用原版 RBAD 的 child 选择，可加多尺度角度稳定性（参考 angle_v2）。
+- **Performance**: vectorize/Cython the v3 completion and centerline Python loops
+  (3–5× speedup expected); cache the first RBAD pass and recompute only bridged
+  regions; reuse the loaded model across a batch.
+- **Accuracy**: use an optic-disc mask (`--disc-mask`) instead of the Gaussian
+  density heuristic for the root; validate `max-distance`/`max-angle` on more
+  images; add multi-scale angle stability.
+- **Robustness**: batch-validate on larger datasets (e.g. MobileLab, 1426 images);
+  handle optic-disc, crossing, and low-contrast cases.
+- **Features**: add box-counting fractal dimension as a global, break-immune
+  feature; output parent→daughter directions for blood-flow analysis.
 
-3. **鲁棒性**：
-   - 在更大数据集（MobileLab 1426 张）上批量验证失败率和参数敏感性。
-   - 处理视盘区域、交叉点、低对比度血管等难例。
+---
 
-4. **功能**：
-   - 加盒计数分形维数作为全局特征（对断点完全免疫，与分叉角互补）。
-   - 输出分叉方向（parent → daughters）用于血流方向分析。
-
-## 目录结构
+## Repository Layout
 
 ```
-RBAD_v2/
-├── infer.py              # 主推理入口
-├── config.py             # 参数控制
-├── detect/               # 分叉检测
-│   ├── two_pass.py       # 两遍法（原版 RBAD + 全岛 + 桥接）
-│   ├── endpoint_bridge.py# 端点桥接
-│   ├── local_bifurcation.py  # 局部检测（备选）
-│   └── utils.py          # 原版 RBAD fast_keypoints
-├── completion/           # v3 概率路径补全
+RetiFlow/
+├── infer.py              # End-to-end inference entry point
+├── config.py             # Parameter control
+├── detect/               # Bifurcation detection
+│   ├── two_pass.py       # Two-pass (original RBAD + all-island + bridge)
+│   ├── endpoint_bridge.py# Endpoint bridging
+│   ├── local_bifurcation.py  # Local detection (alternative)
+│   └── utils.py          # Original RBAD fast_keypoints
+├── completion/           # v3 probability-path completion
 │   ├── completion.py
 │   └── centerline.py
-├── examples/             # 示例输出
+├── examples/             # Example outputs
 └── README.md
 ```
+
+---
+
+## Citation
+
+If you use RetiFlow in your research, please cite this repository.
