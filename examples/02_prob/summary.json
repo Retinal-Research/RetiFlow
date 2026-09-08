@@ -1,0 +1,19 @@
+{
+  "mode": "prob",
+  "root_yx": [
+    304,
+    476
+  ],
+  "RBAD": {
+    "A": {
+      "count": 36,
+      "mean_angle": 76.3
+    },
+    "V": {
+      "count": 56,
+      "mean_angle": 75.12
+    }
+  },
+  "rbad_seconds": 1.222,
+  "input": "rrwnet\\predictions\\02.png"
+}

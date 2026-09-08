@@ -1,16 +1,8 @@
 # -*- coding: utf-8 -*-
-"""RBAD_v2 全部参数控制。"""
+"""RetiFlow 全部参数控制。"""
 from __future__ import annotations
 
 from dataclasses import dataclass, field, asdict
-
-
-@dataclass
-class SegmentationConfig:
-    """RRWNet 分割参数。"""
-    iterations: int = 5          # 递归精炼迭代次数（1=单次，5=循环5次）
-    thred: int = 25              # 增强预处理 ROI 阈值
-    weights: str = "rrwnet_HRF_0.pth"
 
 
 @dataclass
@@ -55,7 +47,6 @@ class RbadConfig:
 
 @dataclass
 class Config:
-    segmentation: SegmentationConfig = field(default_factory=SegmentationConfig)
     completion: CompletionConfig = field(default_factory=CompletionConfig)
     endpoint_bridge: EndpointBridgeConfig = field(default_factory=EndpointBridgeConfig)
     rbad: RbadConfig = field(default_factory=RbadConfig)

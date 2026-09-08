@@ -4,19 +4,23 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-**RetiFlow** is an end-to-end pipeline for retinal artery/vein (A/V) segmentation and
-bifurcation angle measurement. It takes a color fundus image and produces
-per-vessel-type bifurcation detections with angles and branch directions, robust
-to the discontinuous vessel masks that plague real-world segmentation.
+**RetiFlow** is a **bifurcation angle detection** tool for retinal vessels. It
+consumes vessel maps (probability maps, binary masks, or skeletons) and produces
+bifurcation detections with angles and branch directions.
+
+RetiFlow is **independent of any segmentation network** — it does not segment.
+It only consumes vessel maps that you provide. The current results were tested
+on probability maps produced by [RRWNet](https://github.com/j-morano/rrwnet),
+but any upstream segmentation output works.
 
 ---
 
 ## Three Key Improvements
 
 ### 1. A/V maps measured separately
-Arteries and veins are segmented and measured **independently**, not as a single
-vessel tree. Each class gets its own bifurcation statistics (count, angle
-distribution), enabling artery-specific and vein-specific clinical analysis.
+Arteries and veins are measured **independently**, not as a single vessel tree.
+Each class gets its own bifurcation statistics (count, angle distribution),
+enabling artery-specific and vein-specific clinical analysis.
 
 ### 2. Probability-mask completion + centerline extraction
 Instead of hard-thresholding each A/V channel (which breaks thin vessels), the
@@ -33,12 +37,42 @@ continuous skeleton.
 
 ---
 
+## Input Format
+
+RetiFlow accepts three input types. **Give it whatever you have — it degrades
+gracefully.**
+
+### AV3 probability map (recommended, full features)
+
+A single **3-channel image** following the RRWNet **AV3** convention:
+
+| Channel | Content |
+| --- | --- |
+| **R** | Arteries (A) |
+| **G** | Veins (V) |
+| **B** | Vessels (BV, union of A and V) |
+
+Pixel values are probabilities in `[0, 255]` (uint8) or `[0, 1]` (float).
+
+### Binary mask (medium features)
+
+A single-channel binary mask of the vessel tree. RetiFlow extracts the
+centerline and detects bifurcations. No A/V distinction.
+
+### Skeleton (minimal input)
+
+A single-channel binary skeleton (1-pixel-wide vessel centerline). RetiFlow
+detects bifurcations directly. **This is the minimum input** — no A/V/BV
+distinction required.
+
+---
+
 ## Pipeline
 
 ```
-Fundus image
-  → RRWNet segmentation (A/V/BV probability maps)
-  → v3 probability-path completion (BV defines vessel domain, A/V define class)
+Vessel map (AV3 probability / mask / skeleton)
+  → v3 probability-path completion (if AV3: BV defines domain, A/V define class)
+  → centerline extraction (if mask)
   → two-pass RBAD (original fast_keypoints + all-island traversal + endpoint bridge)
   → bifurcation points + angles + branch directions
 ```
@@ -51,30 +85,58 @@ Fundus image
 pip install -r requirements.txt
 ```
 
-Dependencies: `torch`, `torchvision`, `numpy`, `opencv-python`, `scikit-image`,
-`scipy`, `matplotlib`.
+Dependencies: `numpy`, `opencv-python`, `scikit-image`, `scipy`, `matplotlib`.
 
-RRWNet weights (e.g. `rrwnet_HRF_0.pth`) must be reachable; point to them with
-`--weights`.
+> **Note**: RetiFlow does **not** require `torch` or any segmentation network.
+> It only needs the vessel maps as input.
 
 ---
 
 ## Usage
 
-### From a fundus image
+### Single AV3 probability map
 
 ```bash
-python -m RBAD_v2.infer \
-  --image <fundus_image> \
-  --weights rrwnet_HRF_0.pth \
+python -m RetiFlow.infer \
+  --prob <AV3_image.png> \
   --out <output_dir>
 ```
 
-### From saved probability maps (skip RRWNet)
+### Single binary mask
 
 ```bash
-python -m RBAD_v2.infer \
-  --prob-dir <dir with seg_probabilities.npz or seg_A/V/BV.png> \
+python -m RetiFlow.infer \
+  --mask <mask.png> \
+  --out <output_dir>
+```
+
+### Single skeleton (minimal input)
+
+```bash
+python -m RetiFlow.infer \
+  --skeleton <skeleton.png> \
+  --out <output_dir>
+```
+
+### Batch processing
+
+Process every file in a directory as the same input type:
+
+```bash
+python -m RetiFlow.infer \
+  --input-dir <dir> --input-type <prob|mask|skeleton> \
+  --out <output_dir>
+```
+
+### Specify the optic-disc/cup centroid as the root
+
+If an upstream tool (e.g. AutoMorph) provides a more accurate disc/cup centroid,
+pass it as the root instead of the Gaussian-density heuristic:
+
+```bash
+python -m RetiFlow.infer \
+  --prob <AV3_image.png> \
+  --root-x <x> --root-y <y> \
   --out <output_dir>
 ```
 
@@ -83,12 +145,6 @@ python -m RBAD_v2.infer \
 ## Parameters
 
 All parameters live in `config.py`; key ones are overridable on the command line.
-
-### Segmentation (`SegmentationConfig`)
-| Option | Default | Description |
-| --- | --- | --- |
-| `--iterations` | 5 | RRWNet recursive refinement passes (1 = single, 5 = loop) |
-| `thred` | 25 | Enhancement ROI threshold |
 
 ### v3 Completion (`CompletionConfig`)
 | Option | Default | Description |
@@ -116,49 +172,51 @@ All parameters live in `config.py`; key ones are overridable on the command line
 
 ## Example
 
-`examples/02_200228_200228_L_mac/` is a complete run on a real fundus image.
+`examples/01_prob/` and `examples/02_prob/` are complete runs on AV3 probability
+maps (from `rrwnet/predictions`). `examples/02_200228_200228_L_mac/` is a run on
+a real fundus image.
 
 ### A/V bifurcation overlays (with branch directions)
 
 | Artery (A) | Vein (V) |
 | --- | --- |
-| ![A overlay](examples/02_200228_200228_L_mac/overlay_A_aligned.png) | ![V overlay](examples/02_200228_200228_L_mac/overlay_V_aligned.png) |
+| ![A overlay](examples/01_prob/overlay_A_aligned.png) | ![V overlay](examples/01_prob/overlay_V_aligned.png) |
 
 ### Combined A/V/BV map (original RRWNet color convention)
 
 A = magenta, V = cyan, BV = blue, crossing = white.
 
-![AV/BV combined](examples/02_200228_200228_L_mac/AV_BV_combined.png)
+![AV/BV combined](examples/01_prob/AV_BV_combined.png)
 
 ### Completed masks and centerlines
 
 | A mask | V mask | A centerline | V centerline |
 | --- | --- | --- | --- |
-| ![A mask](examples/02_200228_200228_L_mac/A_mask.png) | ![V mask](examples/02_200228_200228_L_mac/V_mask.png) | ![A centerline](examples/02_200228_200228_L_mac/A_centerline.png) | ![V centerline](examples/02_200228_200228_L_mac/V_centerline.png) |
+| ![A mask](examples/01_prob/A_mask.png) | ![V mask](examples/01_prob/V_mask.png) | ![A centerline](examples/01_prob/A_centerline.png) | ![V centerline](examples/01_prob/V_centerline.png) |
 
-### Example result (02_200228_200228_L_mac)
-| Class | Bifurcations | Mean angle |
+### Example results
+| Input | A bifurcations | V bifurcations |
 | --- | --- | --- |
-| A | 27 | 75.6° |
-| V | 44 | 73.6° |
+| `01.png` (AV3) | 30 | 61 |
+| `02.png` (AV3) | 36 | 56 |
 
 ---
 
 ## Performance
 
-Measured on an RTX GPU, 608×608 input, single image:
+Measured on an RTX GPU, 608×608 input, single image (AV3 probability input):
 
-| Stage | Latency | Throughput |
-| --- | --- | --- |
-| RRWNet inference (it5) | 85 ms | 11.7 fps |
-| Segmentation (incl. preprocessing) | ~0.8 s | 1.2 fps |
-| v3 completion (masks) | ~1.2 s | 0.8 fps |
-| Centerlines | ~0.6 s | — |
-| Two-pass RBAD | ~1.2 s | — |
-| **End-to-end total** | **~3.7 s** | **0.27 fps** |
+| Stage | Latency |
+| --- | --- |
+| v3 completion (masks) | ~1.2 s |
+| Centerlines | ~0.6 s |
+| Two-pass RBAD | ~1.2 s |
+| **Total (AV3 input)** | **~3.0 s** |
 
-**Bottleneck**: v3 completion + centerlines + two-pass RBAD (~3 s, ~80% of total).
-RRWNet inference itself is fast (85 ms).
+For **skeleton/mask input** (no completion), the total is ~0.3 s.
+
+**Bottleneck**: v3 completion + centerlines + two-pass RBAD. RetiFlow itself
+does not run a segmentation network.
 
 ### Detection comparison (A/V bifurcation counts)
 | Method | A | V |
@@ -176,12 +234,12 @@ discontinuity problem via all-island traversal and endpoint bridging.
 
 - **Performance**: vectorize/Cython the v3 completion and centerline Python loops
   (3–5× speedup expected); cache the first RBAD pass and recompute only bridged
-  regions; reuse the loaded model across a batch.
-- **Accuracy**: use an optic-disc mask (`--disc-mask`) instead of the Gaussian
-  density heuristic for the root; validate `max-distance`/`max-angle` on more
-  images; add multi-scale angle stability.
-- **Robustness**: batch-validate on larger datasets (e.g. MobileLab, 1426 images);
-  handle optic-disc, crossing, and low-contrast cases.
+  regions.
+- **Accuracy**: use an optic-disc mask instead of the Gaussian density heuristic
+  for the root; validate `max-distance`/`max-angle` on more images; add
+  multi-scale angle stability.
+- **Robustness**: batch-validate on larger datasets; handle optic-disc, crossing,
+  and low-contrast cases.
 - **Features**: add box-counting fractal dimension as a global, break-immune
   feature; output parent→daughter directions for blood-flow analysis.
 
@@ -191,7 +249,7 @@ discontinuity problem via all-island traversal and endpoint bridging.
 
 ```
 RetiFlow/
-├── infer.py              # End-to-end inference entry point
+├── infer.py              # Inference entry point (prob/mask/skeleton, batch)
 ├── config.py             # Parameter control
 ├── detect/               # Bifurcation detection
 │   ├── two_pass.py       # Two-pass (original RBAD + all-island + bridge)

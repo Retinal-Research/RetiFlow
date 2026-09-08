@@ -1,14 +1,25 @@
 # -*- coding: utf-8 -*-
 """
-RBAD_v2 端到端推理：眼底图 -> RRWNet 分割 -> v3 概率补全 -> 两遍法 RBAD 分叉检测。
+RetiFlow — 视网膜分叉角度检测（独立于分割网络）。
 
-用法（从图像）：
-  python -m RBAD_v2.infer --image <眼底图> --weights <rrwnet权重> --out <输出目录>
+RetiFlow 只消费"血管图"，不做分割。输入可以是概率图、二值掩码或骨架，
+给什么都能跑，缺什么就降级。
 
-用法（从已存概率图，跳过 RRWNet）：
-  python -m RBAD_v2.infer --prob-dir <含 seg_probabilities.npz 或 seg_A/V/BV.png 的目录> --out <输出目录>
+输入模式（单张）：
+  --prob <3通道图>       A/V/BV 概率图（R=A, G=V, B=BV，参考 rrwnet AV3 约定）
+  --mask <二值图>        单张二值掩码（无 A/V 之分）
+  --skeleton <二值图>    单张骨架（无 A/V 之分）
 
-参数控制见 config.py，命令行可覆盖关键参数。
+批量模式：
+  --input-dir <目录> --input-type <prob|mask|skeleton>
+  处理目录下所有文件，每个文件是一张图的输入。
+
+可选：
+  --root-x <x> --root-y <y>   指定视盘/杯质心作为 root（比高斯密度启发式更准）
+
+输出（越全面越好）：
+  prob: 补全掩码 + 中心线 + A/V overlay + 组合图 + summary.json
+  mask/skeleton: 中心线 + overlay + summary.json
 """
 from __future__ import annotations
 
@@ -28,60 +39,33 @@ import cv2
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 
-from RBAD_v2.config import Config
-from RBAD_v2.completion.completion import complete_probability_masks
-from RBAD_v2.completion.centerline import extract_centerline
-from RBAD_v2.detect.two_pass import detect_two_pass
-from RBAD_v2.detect.endpoint_bridge import EndpointBridgeConfig as EBConfig
+from RetiFlow.config import Config
+from RetiFlow.completion.completion import complete_probability_masks, ProbabilityConfig
+from RetiFlow.completion.centerline import extract_centerline
+from RetiFlow.detect.two_pass import detect_two_pass
+from RetiFlow.detect.endpoint_bridge import EndpointBridgeConfig as EBConfig
 
 
 # --------------------------------------------------------------------------- #
-# 分割
+# 输入读取
 # --------------------------------------------------------------------------- #
-def segment(image, weights, iterations=5, thred=25):
-    """RRWNet 分割，返回 (pred, enhanced_img)。pred 通道 0=A 1=V 2=BV。"""
-    from rrwnet.model import RRWNet
-    from rrwnet.preprocessing import enhance_image_api
-    from rrwnet.utils import pad_images_unet, to_torch_tensors
-    import torch
-
-    model = RRWNet(iterations=iterations)
-    model.load_state_dict(torch.load(weights, map_location="cpu"), strict=True)
-    model.eval()
-    if torch.cuda.is_available():
-        model.cuda()
-
-    img, mask = enhance_image_api(image, thred=thred)
-    imgs, paddings = pad_images_unet([img, mask])
-    img_pad, padding = imgs[0], paddings[0]
-    roi = np.stack([imgs[1]] * 3, axis=2)
-    tensors = to_torch_tensors([img_pad, roi])
-    image_tensor = tensors[0].unsqueeze(0)
-    mask_tensor = tensors[1].unsqueeze(0)
-    if torch.cuda.is_available():
-        image_tensor = image_tensor.cuda()
-        mask_tensor = mask_tensor.cuda()
-    with torch.no_grad():
-        predictions = model(image_tensor)
-        last_pred = torch.sigmoid(predictions[-1])
-        last_pred[mask_tensor < 0.5] = 0
-        last_pred = last_pred[:, :, padding[0][0]:-padding[0][1],
-                             padding[1][0]:-padding[1][1]]
-    return last_pred[0].cpu().numpy(), img
+def read_prob_image(path):
+    """读 3 通道概率图（R=A, G=V, B=BV），返回 [0,1] 的 (a, v, bv)。"""
+    img = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    if img is None:
+        raise FileNotFoundError(f"cannot read {path}")
+    a = img[..., 2].astype(np.float32) / 255.0   # R
+    v = img[..., 1].astype(np.float32) / 255.0   # G
+    bv = img[..., 0].astype(np.float32) / 255.0  # B
+    return a, v, bv
 
 
-def load_probabilities(prob_dir):
-    """从目录读 A/V/BV 概率图（优先 npz，回退 PNG）。"""
-    prob_dir = Path(prob_dir)
-    npz = prob_dir / "seg_probabilities.npz"
-    if npz.is_file():
-        with np.load(npz, allow_pickle=False) as a:
-            return {k: np.asarray(a[k], np.float32) for k in ("A", "V", "BV")}
-    pngs = {k: prob_dir / f"seg_{k}.png" for k in ("A", "V", "BV")}
-    if all(p.is_file() for p in pngs.values()):
-        return {k: cv2.imread(str(p), 0).astype(np.float32) / 255.0
-                for k, p in pngs.items()}
-    raise FileNotFoundError("no seg_probabilities.npz or seg_A/V/BV.png in " + str(prob_dir))
+def read_binary(path):
+    """读二值图（掩码/骨架），返回 bool 数组。"""
+    img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        raise FileNotFoundError(f"cannot read {path}")
+    return (img > 0).astype(bool)
 
 
 # --------------------------------------------------------------------------- #
@@ -133,71 +117,59 @@ def _to_draw(angles):
     return out
 
 
-# --------------------------------------------------------------------------- #
-# 主流程
-# --------------------------------------------------------------------------- #
-def run(image=None, prob_dir=None, weights=None, out=None, config=None):
-    out = Path(out)
-    out.mkdir(parents=True, exist_ok=True)
-    cfg = config or Config()
+def _angle_stats(angles):
+    if not angles:
+        return {"count": 0, "mean_angle": None}
+    return {"count": len(angles),
+            "mean_angle": round(float(np.mean([d["angle"] for d in angles])), 2)}
 
-    # 1. 分割
-    if prob_dir is not None:
-        probs = load_probabilities(prob_dir)
-        enhanced = None
-        print("[1/4] 从已存概率图读取")
-    else:
-        print("[1/4] RRWNet 分割")
-        pred, enhanced = segment(image, weights, cfg.segmentation.iterations,
-                                 cfg.segmentation.thred)
-        probs = {"A": pred[0], "V": pred[1], "BV": pred[2]}
-        if enhanced is not None:
-            cv2.imwrite(str(out / "enhanced_background.png"),
-                        (enhanced * 255).astype(np.uint8))
-    a_prob, v_prob, bv_prob = probs["A"], probs["V"], probs["BV"]
 
-    # 2. v3 补全
-    print("[2/4] v3 概率路径补全")
-    from RBAD_v2.completion.completion import ProbabilityConfig
+# --------------------------------------------------------------------------- #
+# 核心处理
+# --------------------------------------------------------------------------- #
+def _root_from_bv(bv_prob):
+    from skimage.morphology import skeletonize
+    bv_skel = skeletonize((bv_prob > 0.5).astype(np.uint8)).astype(bool)
+    density = cv2.GaussianBlur(bv_skel.astype(np.float32), (0, 0), 21)
+    return np.unravel_index(int(np.argmax(density)), density.shape)
+
+
+def _bridge_config(cfg):
+    from dataclasses import asdict
+    return EBConfig(**{k: v for k, v in asdict(cfg.endpoint_bridge).items()
+                       if k in EBConfig.__dataclass_fields__})
+
+
+def _rbad_kwargs(cfg):
+    return dict(tail=cfg.rbad.tail, child_min_dist=cfg.rbad.child_min_dist,
+                angle_min=cfg.rbad.angle_min, angle_max=cfg.rbad.angle_max)
+
+
+def process_prob(a, v, bv, cfg, out, root_yx=None):
+    """概率图输入：补全 + 中心线 + 两遍法 RBAD（带 A/V 归属）。"""
     from dataclasses import asdict
     ccfg = ProbabilityConfig(**{k: v for k, v in asdict(cfg.completion).items()
                                 if k in ProbabilityConfig.__dataclass_fields__})
-    am, vm, debug = complete_probability_masks(a_prob, v_prob, bv_prob, config=ccfg)
-    sa, _ = extract_centerline(bv_prob * (0.65 + 0.35 * debug["conditional_a"]), am)
-    sv, _ = extract_centerline(bv_prob * (0.65 + 0.35 * (1 - debug["conditional_a"])), vm)
+    am, vm, debug = complete_probability_masks(a, v, bv, config=ccfg)
+    sa, _ = extract_centerline(bv * (0.65 + 0.35 * debug["conditional_a"]), am)
+    sv, _ = extract_centerline(bv * (0.65 + 0.35 * (1 - debug["conditional_a"])), vm)
     for name, arr in [("A_mask", am), ("V_mask", vm),
                       ("A_centerline", sa), ("V_centerline", sv)]:
         cv2.imwrite(str(out / f"{name}.png"), arr.astype(np.uint8) * 255)
 
-    # 3. 两遍法 RBAD（用 BV root）
-    print("[3/4] 两遍法 RBAD 分叉检测（BV root）")
-    from skimage.morphology import skeletonize
-    bv_skel = skeletonize((bv_prob > 0.5).astype(np.uint8)).astype(bool)
-    density = cv2.GaussianBlur(bv_skel.astype(np.float32), (0, 0), 21)
-    bv_root = np.unravel_index(int(np.argmax(density)), density.shape)
-    eb = EBConfig(**{k: v for k, v in asdict(cfg.endpoint_bridge).items()
-                     if k in EBConfig.__dataclass_fields__})
+    if root_yx is None:
+        root_yx = _root_from_bv(bv)
+    eb = _bridge_config(cfg)
+    kw = _rbad_kwargs(cfg)
     t0 = time.perf_counter()
-    _, res_a = detect_two_pass(sa, bv_probability=bv_prob, bridge_config=eb,
-                               root_yx=bv_root, tail=cfg.rbad.tail,
-                               child_min_dist=cfg.rbad.child_min_dist,
-                               angle_min=cfg.rbad.angle_min,
-                               angle_max=cfg.rbad.angle_max)
-    _, res_v = detect_two_pass(sv, bv_probability=bv_prob, bridge_config=eb,
-                               root_yx=bv_root, tail=cfg.rbad.tail,
-                               child_min_dist=cfg.rbad.child_min_dist,
-                               angle_min=cfg.rbad.angle_min,
-                               angle_max=cfg.rbad.angle_max)
+    _, res_a = detect_two_pass(sa, bv_probability=bv, bridge_config=eb,
+                               root_yx=root_yx, **kw)
+    _, res_v = detect_two_pass(sv, bv_probability=bv, bridge_config=eb,
+                               root_yx=root_yx, **kw)
     t_rbad = time.perf_counter() - t0
     det_a, det_v = res_a["after"]["angles"], res_v["after"]["angles"]
-    print(f"  A: {len(det_a)} 分叉, V: {len(det_v)} 分叉")
 
-    # 4. 可视化 + 摘要
-    print("[4/4] 可视化 + 摘要")
-    if enhanced is not None:
-        bg = enhanced
-    else:
-        bg = cv2.cvtColor((bv_prob * 255).astype(np.uint8), cv2.COLOR_GRAY2RGB) / 255.0
+    bg = cv2.cvtColor((bv * 255).astype(np.uint8), cv2.COLOR_GRAY2RGB) / 255.0
     cv2.imwrite(str(out / "overlay_A_aligned.png"),
                 draw_overlay(bg, sa, _to_draw(det_a), color=(0, 0, 255)))
     cv2.imwrite(str(out / "overlay_V_aligned.png"),
@@ -205,34 +177,103 @@ def run(image=None, prob_dir=None, weights=None, out=None, config=None):
     av_bv = draw_av_bv_rgb(am | vm, am, vm)
     cv2.imwrite(str(out / "AV_BV_combined.png"), cv2.cvtColor(av_bv, cv2.COLOR_RGB2BGR))
 
-    summary = {
-        "image": image, "prob_dir": str(prob_dir) if prob_dir else None,
-        "config": cfg.to_dict(),
-        "BV_root_yx": [int(bv_root[0]), int(bv_root[1])],
-        "RBAD": {
-            "A": {"count": len(det_a),
-                  "mean_angle": round(float(np.mean([d["angle"] for d in det_a])), 2) if det_a else None},
-            "V": {"count": len(det_v),
-                  "mean_angle": round(float(np.mean([d["angle"] for d in det_v])), 2) if det_v else None},
-        },
+    return {
+        "mode": "prob",
+        "root_yx": [int(root_yx[0]), int(root_yx[1])],
+        "RBAD": {"A": _angle_stats(det_a), "V": _angle_stats(det_v)},
         "rbad_seconds": round(t_rbad, 3),
-        "accepted_bridges": {k: len(v) for k, v in debug["bridges"].items()},
     }
+
+
+def process_single(skel, cfg, out, root_yx=None, is_mask=False):
+    """单张掩码/骨架输入：中心线（若掩码）+ 两遍法 RBAD（无 A/V 归属）。"""
+    if is_mask:
+        from skimage.morphology import skeletonize
+        skel = skeletonize(skel.astype(np.uint8)).astype(bool)
+        cv2.imwrite(str(out / "centerline.png"), skel.astype(np.uint8) * 255)
+    eb = _bridge_config(cfg)
+    kw = _rbad_kwargs(cfg)
+    t0 = time.perf_counter()
+    _, res = detect_two_pass(skel, bv_probability=None, bridge_config=eb,
+                             root_yx=root_yx, **kw)
+    t_rbad = time.perf_counter() - t0
+    det = res["after"]["angles"]
+
+    bg = np.zeros((*skel.shape, 3), dtype=np.uint8)
+    cv2.imwrite(str(out / "overlay.png"),
+                draw_overlay(bg, skel, _to_draw(det), color=(0, 0, 255)))
+
+    return {
+        "mode": "mask" if is_mask else "skeleton",
+        "root_yx": [int(res["after"]["root_yx"][0]), int(res["after"]["root_yx"][1])]
+                   if res["after"]["root_yx"] else None,
+        "RBAD": _angle_stats(det),
+        "rbad_seconds": round(t_rbad, 3),
+    }
+
+
+def run_single(input_path, input_type, cfg, out, root_yx=None):
+    out = Path(out)
+    out.mkdir(parents=True, exist_ok=True)
+    if input_type == "prob":
+        a, v, bv = read_prob_image(input_path)
+        summary = process_prob(a, v, bv, cfg, out, root_yx)
+    elif input_type == "mask":
+        skel = read_binary(input_path)
+        summary = process_single(skel, cfg, out, root_yx, is_mask=True)
+    elif input_type == "skeleton":
+        skel = read_binary(input_path)
+        summary = process_single(skel, cfg, out, root_yx, is_mask=False)
+    else:
+        raise ValueError(f"unknown input_type: {input_type}")
+    summary["input"] = str(input_path)
     with (out / "summary.json").open("w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
-    print(json.dumps(summary, indent=2, ensure_ascii=False))
-    print(f"\n输出: {out}")
     return summary
 
 
+def run_batch(input_dir, input_type, cfg, out, root_yx=None):
+    input_dir = Path(input_dir)
+    out = Path(out)
+    out.mkdir(parents=True, exist_ok=True)
+    exts = (".png", ".jpg", ".jpeg", ".npz")
+    files = sorted(f for f in input_dir.iterdir()
+                   if f.is_file() and f.suffix.lower() in exts)
+    if not files:
+        raise FileNotFoundError(f"no input files in {input_dir}")
+    results = []
+    for f in files:
+        print(f"[{files.index(f)+1}/{len(files)}] {f.name}")
+        sub = out / f.stem
+        try:
+            summary = run_single(f, input_type, cfg, sub, root_yx)
+            results.append(summary)
+        except Exception as e:
+            results.append({"input": str(f), "error": str(e)})
+            print(f"  ERROR: {e}")
+    with (out / "summary.json").open("w", encoding="utf-8") as f:
+        json.dump({"input_dir": str(input_dir), "input_type": input_type,
+                   "n": len(results), "results": results},
+                  f, indent=2, ensure_ascii=False)
+    return results
+
+
+# --------------------------------------------------------------------------- #
+# CLI
+# --------------------------------------------------------------------------- #
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--image", type=Path)
-    ap.add_argument("--prob-dir", type=Path)
-    ap.add_argument("--weights", default=str(HERE / "rrwnet_HRF_0.pth"))
+    g = ap.add_mutually_exclusive_group(required=True)
+    g.add_argument("--prob", type=Path, help="单张 3 通道 A/V/BV 概率图")
+    g.add_argument("--mask", type=Path, help="单张二值掩码")
+    g.add_argument("--skeleton", type=Path, help="单张骨架")
+    g.add_argument("--input-dir", type=Path, help="批量输入目录")
+    ap.add_argument("--input-type", choices=("prob", "mask", "skeleton"),
+                    help="批量输入类型（--input-dir 时必填）")
     ap.add_argument("--out", required=True, type=Path)
-    # 关键参数覆盖
-    ap.add_argument("--iterations", type=int)
+    ap.add_argument("--root-x", type=float)
+    ap.add_argument("--root-y", type=float)
+    # 参数覆盖
     ap.add_argument("--max-bridge-length", type=float)
     ap.add_argument("--max-opposite-run", type=int)
     ap.add_argument("--bridge-passes", type=int)
@@ -242,12 +283,12 @@ def main():
     ap.add_argument("--tail", type=int)
     args = ap.parse_args()
 
-    if args.image is None and args.prob_dir is None:
-        ap.error("must provide --image or --prob-dir")
+    if args.input_dir is not None and args.input_type is None:
+        ap.error("--input-dir requires --input-type")
+    if (args.root_x is None) != (args.root_y is None):
+        ap.error("--root-x and --root-y must be provided together")
 
     cfg = Config()
-    if args.iterations is not None:
-        cfg.segmentation.iterations = args.iterations
     if args.max_bridge_length is not None:
         cfg.completion.max_bridge_length = args.max_bridge_length
     if args.max_opposite_run is not None:
@@ -263,9 +304,16 @@ def main():
     if args.tail is not None:
         cfg.rbad.tail = args.tail
 
-    run(image=str(args.image) if args.image else None,
-        prob_dir=str(args.prob_dir) if args.prob_dir else None,
-        weights=args.weights, out=str(args.out), config=cfg)
+    root_yx = (args.root_y, args.root_x) if args.root_x is not None else None
+
+    if args.input_dir is not None:
+        run_batch(args.input_dir, args.input_type, cfg, args.out, root_yx)
+    elif args.prob is not None:
+        run_single(args.prob, "prob", cfg, args.out, root_yx)
+    elif args.mask is not None:
+        run_single(args.mask, "mask", cfg, args.out, root_yx)
+    elif args.skeleton is not None:
+        run_single(args.skeleton, "skeleton", cfg, args.out, root_yx)
 
 
 if __name__ == "__main__":
