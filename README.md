@@ -172,33 +172,33 @@ All parameters live in `config.py`; key ones are overridable on the command line
 
 ## Example
 
-`examples/01_prob/` and `examples/02_prob/` are complete runs on AV3 probability
-maps (from `rrwnet/predictions`). `examples/02_200228_200228_L_mac/` is a run on
-a real fundus image.
+`examples/02_200228_200228_L_mac/` is the primary example — a complete run on a
+real fundus image (best result). `examples/02_prob/` is a run on an AV3
+probability map from `rrwnet/predictions`, as an RRWNet reference.
 
 ### A/V bifurcation overlays (with branch directions)
 
 | Artery (A) | Vein (V) |
 | --- | --- |
-| ![A overlay](examples/01_prob/overlay_A_aligned.png) | ![V overlay](examples/01_prob/overlay_V_aligned.png) |
+| ![A overlay](examples/02_200228_200228_L_mac/overlay_A_aligned.png) | ![V overlay](examples/02_200228_200228_L_mac/overlay_V_aligned.png) |
 
 ### Combined A/V/BV map (original RRWNet color convention)
 
 A = magenta, V = cyan, BV = blue, crossing = white.
 
-![AV/BV combined](examples/01_prob/AV_BV_combined.png)
+![AV/BV combined](examples/02_200228_200228_L_mac/AV_BV_combined.png)
 
 ### Completed masks and centerlines
 
 | A mask | V mask | A centerline | V centerline |
 | --- | --- | --- | --- |
-| ![A mask](examples/01_prob/A_mask.png) | ![V mask](examples/01_prob/V_mask.png) | ![A centerline](examples/01_prob/A_centerline.png) | ![V centerline](examples/01_prob/V_centerline.png) |
+| ![A mask](examples/02_200228_200228_L_mac/A_mask.png) | ![V mask](examples/02_200228_200228_L_mac/V_mask.png) | ![A centerline](examples/02_200228_200228_L_mac/A_centerline.png) | ![V centerline](examples/02_200228_200228_L_mac/V_centerline.png) |
 
 ### Example results
 | Input | A bifurcations | V bifurcations |
 | --- | --- | --- |
-| `01.png` (AV3) | 30 | 61 |
-| `02.png` (AV3) | 36 | 56 |
+| `02_200228_200228_L_mac` (fundus) | 27 | 44 |
+| `02_prob` (AV3, rrwnet reference) | 36 | 56 |
 
 ---
 
