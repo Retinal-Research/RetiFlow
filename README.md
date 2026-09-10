@@ -35,7 +35,7 @@ bridged (or an endpoint lands on a foreign branch body) under strict geometric
 and BV-support checks. The original RBAD angle logic then runs on the repaired,
 continuous skeleton.
 
-### 4. CrossBone (交叉骨) — Gaussian crossing-point centroid (core advantage)
+### 4. CrossBone — Gaussian crossing-point centroid (core advantage)
 The optic-disc/root is located by the **density of crossing points** (junctions),
 not the whole skeleton. Junctions are found by a lightweight local count
 (3×3 neighborhood with ≥3 neighbors), then a Gaussian is placed at each and
