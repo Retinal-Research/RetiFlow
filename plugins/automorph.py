@@ -31,13 +31,29 @@ from pathlib import Path
 
 import numpy as np
 import cv2
+from tqdm import tqdm
 
 HERE = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(HERE))
 
-from RetiFlow.infer import process_single, _angle_stats
+from RetiFlow.infer import process_single, process_prob, _angle_stats, plot_centroid
 from RetiFlow.config import Config
 from RetiFlow.detect.centroid import binary_centroid, gaussian_center, vote_centroid
+
+
+def _resize_av3(a, v, bv, target):
+    """把 A/V/BV 缩放到 target 边长（最长边）。"""
+    h, w = a.shape[:2]
+    scale = target / float(max(h, w))
+    if scale >= 1.0:
+        return a, v, bv
+    new_w, new_h = int(round(w * scale)), int(round(h * scale))
+    a = cv2.resize(a.astype(np.float32), (new_w, new_h), interpolation=cv2.INTER_AREA)
+    if v is not None:
+        v = cv2.resize(v.astype(np.float32), (new_w, new_h), interpolation=cv2.INTER_AREA)
+    if bv is not None:
+        bv = cv2.resize(bv.astype(np.float32), (new_w, new_h), interpolation=cv2.INTER_AREA)
+    return a, v, bv
 
 
 class AutomorphAdapter:
@@ -78,19 +94,60 @@ class AutomorphAdapter:
         v = self._read("vein_binary_process", name)
         return a, v
 
+    def get_av3(self, name):
+        """返回 AV3 概率图 (a, v, bv)，由分离的 A/V/BV 文件合并（R=A, G=V, B=BV）。
+
+        注意：artery_vein/raw 的通道不相交，不是标准 AV3；用分离文件更可靠。
+        """
+        a = self._read("artery_binary_process", name)
+        v = self._read("vein_binary_process", name)
+        bv = self._read("binary_process", name, sub="binary_vessel")
+        if a is None or v is None or bv is None:
+            return None
+        # 合并成 AV3（R=A, G=V, B=BV），0/1 概率
+        av3 = np.zeros((*a.shape, 3), dtype=np.float32)
+        av3[..., 2] = a.astype(np.float32)   # R = A
+        av3[..., 1] = v.astype(np.float32)   # G = V
+        av3[..., 0] = bv.astype(np.float32)  # B = BV
+        return av3[..., 2], av3[..., 1], av3[..., 0]
+
     def get_vessel_skeleton(self, name):
         """返回血管骨架（binary_vessel）。"""
         return self._read("binary_skeleton", name, sub="binary_vessel")
 
     def get_disc_center(self, name, robust=True):
-        """返回视盘质心 (y, x)，来自 optic_disc_cup/raw 的 R 通道。"""
+        """返回视盘质心归一化比例 (dy, dx)，来自 optic_disc_cup/raw 的 R 通道。
+
+        返回 [0,1] 的比例（相对 disc mask 分辨率），分辨率无关，任何分辨率都能对齐。
+        """
         p = self.dc_dir / "raw" / f"{name}.png"
         if not p.is_file():
             return None
         img = cv2.imread(str(p), cv2.IMREAD_COLOR)
         if img is None:
             return None
-        return binary_centroid(img[..., 2] > 0, robust=robust)  # R 通道 = disc
+        c = binary_centroid(img[..., 2] > 0, robust=robust)  # R 通道 = disc
+        if c is None:
+            return None
+        return (c[0] / img.shape[0], c[1] / img.shape[1])  # (dy, dx) 比例
+
+    def get_cup_center(self, name, robust=True):
+        """返回视杯质心归一化比例 (dy, dx)，来自 optic_disc_cup/raw 的 B 通道。
+
+        cup 比 disc 小，用更小的 min_area_frac 避免被当噪声过滤。
+        返回 [0,1] 的比例（相对 disc mask 分辨率）。
+        """
+        p = self.dc_dir / "raw" / f"{name}.png"
+        if not p.is_file():
+            return None
+        img = cv2.imread(str(p), cv2.IMREAD_COLOR)
+        if img is None:
+            return None
+        c = binary_centroid(img[..., 0] > 0, robust=robust,
+                            min_area_frac=0.001)  # B 通道 = cup
+        if c is None:
+            return None
+        return (c[0] / img.shape[0], c[1] / img.shape[1])  # (dy, dx) 比例
 
     def get_gaussian_center(self, skeleton):
         """返回高斯密度质心 (y, x)。"""
@@ -98,67 +155,115 @@ class AutomorphAdapter:
 
     # -- 运行 ------------------------------------------------------------- #
     def run(self, out_dir, mode="skeleton", use_disc_root=True, config=None,
-            root_yx=None):
+            root_yx=None, resize=None, gradable_csv=None, limit=None):
         """对每张图跑 RetiFlow 分叉检测。
 
-        mode: 'skeleton'（用 AutoMorph 骨架）或 'mask'（用掩码提取中心线）。
+        mode: 'prob'（喂 AV3 raw 给完整流水线，用补全）
+              'skeleton'（用 AutoMorph 骨架）或 'mask'（用掩码提取中心线）。
         use_disc_root: 用视盘质心作为 root。
         root_yx: 手动指定 root (y, x)，覆盖视盘质心。
+        resize: 若指定，把输入缩放到该边长（如 512），加速处理。
+        gradable_csv: M1_quality_final.csv 路径，只处理 Gradable=True 的图像。
+        limit: 若指定，只处理前 N 张（调试用）。
         """
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         cfg = config or Config()
         names = self.list_images()
+        if gradable_csv:
+            import csv
+            with open(gradable_csv, encoding="utf-8") as f:
+                rows = list(csv.DictReader(f))
+            gradable = {Path(r["Name"]).stem for r in rows
+                        if r["Gradable"].strip().lower() == "true"}
+            names = [n for n in names if n in gradable]
+            print(f"gradable 图像: {len(names)} / {len(self.list_images())}")
+        if limit:
+            names = names[:limit]
+            print(f"limit: 只处理前 {len(names)} 张")
         results = []
-        for i, name in enumerate(names):
-            print(f"[{i+1}/{len(names)}] {name}")
+        for i, name in enumerate(tqdm(names, desc="RetiFlow-Angle", unit="img")):
             sub = out_dir / name
             sub.mkdir(parents=True, exist_ok=True)
             try:
-                if mode == "skeleton":
-                    a, v = self.get_skeletons(name)
+                # 先拿 A/V（得到分辨率），再算 disc/cup（需缩放到该分辨率）
+                gauss_center = None
+                if mode == "prob":
+                    av3 = self.get_av3(name)
+                    if av3 is None:
+                        raise FileNotFoundError(f"missing AV3 raw for {name}")
+                    a, v, bv = av3
+                    if resize:
+                        a, v, bv = _resize_av3(a, v, bv, resize)
+                    gauss_center = self.get_gaussian_center((a > 0.5) | (v > 0.5))
                 else:
-                    a, v = self.get_masks(name)
-                if a is None or v is None:
-                    raise FileNotFoundError(f"missing A/V for {name}")
+                    if mode == "skeleton":
+                        a, v = self.get_skeletons(name)
+                    else:
+                        a, v = self.get_masks(name)
+                    if a is None or v is None:
+                        raise FileNotFoundError(f"missing A/V for {name}")
+                    if resize:
+                        a, v = _resize_av3(a, v, None, resize)[:2]
+                    # 高斯质心用整个血管（A|V），不是只用 A
+                    gauss_center = self.get_gaussian_center((a > 0) | (v > 0))
+                # disc/cup 质心是归一化比例 (dy, dx)，gauss 是像素 → 转比例后投票
+                disc_ratio = self.get_disc_center(name, robust=True) if use_disc_root else None
+                cup_ratio = self.get_cup_center(name, robust=True) if use_disc_root else None
+                gauss_ratio = None
+                if gauss_center is not None:
+                    gauss_ratio = (gauss_center[0] / a.shape[0], gauss_center[1] / a.shape[1])
+                # 只有 mask（无视盘）时，只算高斯
+                voted_ratio = vote_centroid([disc_ratio, cup_ratio, gauss_ratio])
+                if voted_ratio is not None:
+                    r = (voted_ratio[0] * a.shape[0], voted_ratio[1] * a.shape[1])
+                else:
+                    r = None
+                r = root_yx or r
 
-                # root：三个质心候选投票，防止单个离谱
-                disc_robust = self.get_disc_center(name, robust=True) if use_disc_root else None
-                disc_simple = self.get_disc_center(name, robust=False) if use_disc_root else None
-                gauss_center = self.get_gaussian_center(a)
-                voted = self.vote_centroid([disc_robust, disc_simple, gauss_center])
-                r = root_yx or voted
-                if root_yx is None and voted is not None:
-                    print(f"  voted root: {voted} "
-                          f"(disc_robust={disc_robust}, disc_simple={disc_simple}, gauss={gauss_center})")
+                # 处理
+                if mode == "prob":
+                    res = process_prob(a, v, bv, cfg, sub, r)
+                    res_a, res_v = res["RBAD"]["A"], res["RBAD"]["V"]
+                    bg = cv2.cvtColor((bv * 255).astype(np.uint8), cv2.COLOR_GRAY2RGB) / 255.0
+                else:
+                    res_a = process_single(a, cfg, sub / "A", r, is_mask=(mode == "mask"))
+                    res_v = process_single(v, cfg, sub / "V", r, is_mask=(mode == "mask"))
+                    res_a, res_v = res_a["RBAD"], res_v["RBAD"]
+                    bg = cv2.cvtColor((a.astype(np.uint8) * 255), cv2.COLOR_GRAY2RGB) / 255.0
 
-                # 分别跑 A 和 V
-                res_a = process_single(a, cfg, sub / "A", r, is_mask=(mode == "mask"))
-                res_v = process_single(v, cfg, sub / "V", r, is_mask=(mode == "mask"))
+                # 质心候选投票图（disc / cup / gauss / voted），比例转像素
+                disc_px = (disc_ratio[0] * a.shape[0], disc_ratio[1] * a.shape[1]) if disc_ratio else None
+                cup_px = (cup_ratio[0] * a.shape[0], cup_ratio[1] * a.shape[1]) if cup_ratio else None
+                plot_centroid(
+                    bg,
+                    [disc_px, cup_px, gauss_center, r],
+                    sub / "centroid.png",
+                    labels=["disc", "cup", "gauss", "voted"],
+                )
 
                 entry = {
                     "image": name,
                     "mode": mode,
                     "root_yx": [int(r[0]), int(r[1])] if r else None,
-                    "disc_robust": [round(disc_robust[0], 1), round(disc_robust[1], 1)]
-                                   if disc_robust else None,
-                    "disc_simple": [round(disc_simple[0], 1), round(disc_simple[1], 1)]
-                                   if disc_simple else None,
-                    "gauss_center": [round(gauss_center[0], 1), round(gauss_center[1], 1)]
-                                    if gauss_center else None,
-                    "voted_center": [round(voted[0], 1), round(voted[1], 1)]
-                                     if voted else None,
+                    "disc_ratio": [round(disc_ratio[0], 4), round(disc_ratio[1], 4)]
+                                   if disc_ratio else None,
+                    "cup_ratio": [round(cup_ratio[0], 4), round(cup_ratio[1], 4)]
+                                  if cup_ratio else None,
+                    "gauss_center": [int(gauss_center[0]), int(gauss_center[1])]
+                                     if gauss_center else None,
+                    "voted_center": [int(r[0]), int(r[1])] if r else None,
                     "root_source": "manual" if root_yx else "vote",
-                    "A": res_a["RBAD"],
-                    "V": res_v["RBAD"],
+                    "A": res_a,
+                    "V": res_v,
                 }
                 results.append(entry)
                 with (sub / "summary.json").open("w", encoding="utf-8") as f:
                     json.dump(entry, f, indent=2, ensure_ascii=False)
-                print(f"  A: {res_a['RBAD']['count']}  V: {res_v['RBAD']['count']}  root: {entry['root_source']}")
             except Exception as e:
+                import traceback
+                traceback.print_exc()
                 results.append({"image": name, "error": str(e)})
-                print(f"  ERROR: {e}")
 
         with (out_dir / "summary.json").open("w", encoding="utf-8") as f:
             json.dump({"m2_dir": str(self.m2_dir), "mode": mode,
@@ -172,8 +277,13 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--m2-dir", required=True)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--mode", choices=("skeleton", "mask"), default="skeleton")
+    ap.add_argument("--mode", choices=("prob", "skeleton", "mask"), default="skeleton")
+    ap.add_argument("--resize", type=int, default=None, help="缩放到该边长（如 512）加速")
+    ap.add_argument("--gradable-csv", type=Path, default=None,
+                    help="M1_quality_final.csv，只处理 Gradable=True 的图像")
     ap.add_argument("--no-disc-root", action="store_true")
+    ap.add_argument("--limit", type=int, default=None, help="只处理前 N 张（调试用）")
     args = ap.parse_args()
     adapter = AutomorphAdapter(args.m2_dir)
-    adapter.run(args.out, mode=args.mode, use_disc_root=not args.no_disc_root)
+    adapter.run(args.out, mode=args.mode, use_disc_root=not args.no_disc_root,
+                resize=args.resize, gradable_csv=args.gradable_csv, limit=args.limit)

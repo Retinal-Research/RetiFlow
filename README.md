@@ -35,6 +35,17 @@ bridged (or an endpoint lands on a foreign branch body) under strict geometric
 and BV-support checks. The original RBAD angle logic then runs on the repaired,
 continuous skeleton.
 
+### 4. CrossBone (交叉骨) — Gaussian crossing-point centroid (core advantage)
+The optic-disc/root is located by the **density of crossing points** (junctions),
+not the whole skeleton. Junctions are found by a lightweight local count
+(3×3 neighborhood with ≥3 neighbors), then a Gaussian is placed at each and
+summed; the density peak is the root. This is:
+- **Root-independent** — no need to know the root before finding it.
+- **Fast** — one convolution finds all junctions.
+- **Break-immune** — local per-pixel, unaffected by disconnected vessels.
+
+In most cases this is highly accurate, and it is RetiFlow's core advantage.
+
 ---
 
 ## Input Format

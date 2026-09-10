@@ -101,6 +101,37 @@ def draw_av_bv_rgb(bv, a, v):
     return rgb
 
 
+def plot_centroid(bg, points, out_path, labels=None, colors=None):
+    """把质心点画到背景图上，保存。
+
+    Parameters
+    ----------
+    bg : HxWx3 背景图（BGR 或 RGB，uint8 或 [0,1]）。
+    points : [(y, x), ...] 质心坐标。
+    out_path : 保存路径。
+    labels : [str, ...] 每个点的标签（可选）。
+    colors : [BGR, ...] 每个点的颜色（可选）。
+    """
+    bgr = (bg * 255).astype(np.uint8)
+    if bgr.ndim == 2:
+        bgr = cv2.cvtColor(bgr, cv2.COLOR_GRAY2BGR)
+    canvas = bgr.copy()
+    default_colors = [(0, 0, 255), (255, 0, 0), (0, 255, 0), (0, 255, 255),
+                      (255, 0, 255), (255, 255, 0)]
+    for i, point in enumerate(points):
+        if point is None:
+            continue
+        y, x = point
+        color = colors[i] if colors and i < len(colors) else default_colors[i % len(default_colors)]
+        cv2.circle(canvas, (int(round(x)), int(round(y))), 6, color, -1)
+        cv2.drawMarker(canvas, (int(round(x)), int(round(y))), color,
+                       markerType=cv2.MARKER_CROSS, markerSize=16, thickness=2)
+        if labels and i < len(labels):
+            cv2.putText(canvas, str(labels[i]), (int(round(x)) + 8, int(round(y)) - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+    cv2.imwrite(str(out_path), canvas)
+
+
 def _to_draw(angles):
     """把两遍法 angles 转成 draw_overlay 需要的格式（含 daughters 方向）。"""
     out = []
@@ -147,6 +178,8 @@ def _rbad_kwargs(cfg):
 
 def process_prob(a, v, bv, cfg, out, root_yx=None):
     """概率图输入：补全 + 中心线 + 两遍法 RBAD（带 A/V 归属）。"""
+    out = Path(out)
+    out.mkdir(parents=True, exist_ok=True)
     from dataclasses import asdict
     ccfg = ProbabilityConfig(**{k: v for k, v in asdict(cfg.completion).items()
                                 if k in ProbabilityConfig.__dataclass_fields__})
@@ -170,6 +203,7 @@ def process_prob(a, v, bv, cfg, out, root_yx=None):
     det_a, det_v = res_a["after"]["angles"], res_v["after"]["angles"]
 
     bg = cv2.cvtColor((bv * 255).astype(np.uint8), cv2.COLOR_GRAY2RGB) / 255.0
+    plot_centroid(bg, [root_yx], out / "root.png", labels=["root"])
     cv2.imwrite(str(out / "overlay_A_aligned.png"),
                 draw_overlay(bg, sa, _to_draw(det_a), color=(0, 0, 255)))
     cv2.imwrite(str(out / "overlay_V_aligned.png"),
@@ -180,7 +214,10 @@ def process_prob(a, v, bv, cfg, out, root_yx=None):
     return {
         "mode": "prob",
         "root_yx": [int(root_yx[0]), int(root_yx[1])],
-        "RBAD": {"A": _angle_stats(det_a), "V": _angle_stats(det_v)},
+        "RBAD": {
+            "A": {**_angle_stats(det_a), "angles": [round(d["angle"], 3) for d in det_a]},
+            "V": {**_angle_stats(det_v), "angles": [round(d["angle"], 3) for d in det_v]},
+        },
         "rbad_seconds": round(t_rbad, 3),
     }
 
@@ -202,6 +239,8 @@ def process_single(skel, cfg, out, root_yx=None, is_mask=False):
     det = res["after"]["angles"]
 
     bg = np.zeros((*skel.shape, 3), dtype=np.uint8)
+    if root_yx is not None:
+        plot_centroid(bg, [root_yx], out / "root.png", labels=["root"])
     cv2.imwrite(str(out / "overlay.png"),
                 draw_overlay(bg, skel, _to_draw(det), color=(0, 0, 255)))
 
@@ -209,7 +248,7 @@ def process_single(skel, cfg, out, root_yx=None, is_mask=False):
         "mode": "mask" if is_mask else "skeleton",
         "root_yx": [int(res["after"]["root_yx"][0]), int(res["after"]["root_yx"][1])]
                    if res["after"]["root_yx"] else None,
-        "RBAD": _angle_stats(det),
+        "RBAD": {**_angle_stats(det), "angles": [round(d["angle"], 3) for d in det]},
         "rbad_seconds": round(t_rbad, 3),
     }
 
